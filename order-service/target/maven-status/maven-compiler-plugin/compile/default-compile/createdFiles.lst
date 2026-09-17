@@ -1,0 +1,11 @@
+fr\guezrou\ecommerce\order\rest\controller\OrderController.class
+fr\guezrou\ecommerce\db\repository\OrderLineEntity.class
+fr\guezrou\ecommerce\OrderServiceApplication.class
+fr\guezrou\ecommerce\order\model\OrderLine.class
+fr\guezrou\ecommerce\order\rest\request\CreateOrderRequest.class
+fr\guezrou\ecommerce\db\repository\OrderRepositorty.class
+fr\guezrou\ecommerce\order\model\Order.class
+fr\guezrou\ecommerce\db\repository\OrderEntity.class
+fr\guezrou\ecommerce\order\model\OrderStatuts.class
+fr\guezrou\ecommerce\order\service\CreateOrderService.class
+fr\guezrou\ecommerce\order\rest\response\OrderResponse.class
