@@ -1,5 +1,15 @@
 services:
 
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: poc-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbit
+      RABBITMQ_DEFAULT_PASS: rabbit
+    ports:
+      - "5672:5672"
+      - "15672:15672"
   postgres:
     image: postgres:17
     container_name: db-postgres

@@ -8,6 +8,9 @@ import org.springframework.transaction.annotation.Transactional;
 import fr.guezrou.ecommerce.payment.db.entity.PaymentEntity;
 import fr.guezrou.ecommerce.payment.db.entity.PaymentStatus;
 import fr.guezrou.ecommerce.payment.db.repository.PaymentRepository;
+import fr.guezrou.ecommerce.payment.event.PaymentCompletedEvent;
+import fr.guezrou.ecommerce.payment.event.PaymentEventPublisher;
+import fr.guezrou.ecommerce.payment.event.PaymentFailedEvent;
 import fr.guezrou.ecommerce.payment.rest.request.PaymentRequest;
 import fr.guezrou.ecommerce.payment.rest.response.PaymentResponse;
 import lombok.RequiredArgsConstructor;
@@ -17,6 +20,7 @@ import lombok.RequiredArgsConstructor;
 public class PaymentService {
 
     private final PaymentRepository paymentRepository;
+    private final PaymentEventPublisher paymentEventPublisher;
 
     @Transactional
     public PaymentResponse processPayment(PaymentRequest request) {
@@ -31,15 +35,29 @@ public class PaymentService {
 
         paymentRepository.save(payment);
 
-        // Simulation du paiement appel au partenaire
         boolean paymentAccepted = false;
 
         if (paymentAccepted) {
+
             payment.setStatus(PaymentStatus.COMPLETED);
+
+            paymentRepository.save(payment);
+
+            PaymentCompletedEvent event = new PaymentCompletedEvent(payment.getOrderId(), payment.getId(),
+                    payment.getAmount());
+
+            paymentEventPublisher.publishPaymentCompleted(event);
+
         } else {
+
             payment.setStatus(PaymentStatus.FAILED);
+
+            paymentRepository.save(payment);
+
+            PaymentFailedEvent event = new PaymentFailedEvent(payment.getOrderId(), "Payment was refused");
+
+            paymentEventPublisher.publishPaymentFailed(event);
         }
-        paymentRepository.save(payment);
 
         return new PaymentResponse(payment.getId(), payment.getOrderId(), payment.getStatus().name(),
                 payment.getAmount());
