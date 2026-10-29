@@ -2,25 +2,28 @@ package fr.guezrou.ecommerce.order.service;
 
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import fr.guezrou.ecommerce.db.repository.OrderEntity;
 import fr.guezrou.ecommerce.db.repository.OrderLineEntity;
 import fr.guezrou.ecommerce.db.repository.OrderRepositorty;
-import fr.guezrou.ecommerce.order.exceptions.OrderCreationException;
-import fr.guezrou.ecommerce.order.exceptions.StockServiceException;
-import fr.guezrou.ecommerce.order.rest.client.PaymentClient;
-import fr.guezrou.ecommerce.order.rest.client.StockClient;
+import fr.guezrou.ecommerce.db.repository.OutboxEventEntity;
+import fr.guezrou.ecommerce.db.repository.OutboxEventRepository;
+import fr.guezrou.ecommerce.order.event.config.KafkaConfig;
+import fr.guezrou.ecommerce.order.event.dto.OrderCreatedEvent;
+import fr.guezrou.ecommerce.order.event.dto.OrderLineEvent;
+import fr.guezrou.ecommerce.order.event.publisher.OrderEventPublisher;
+import fr.guezrou.ecommerce.order.event.publisher.StockCommandPublisher;
+import fr.guezrou.ecommerce.order.exceptions.OrderNotFoundException;
 import fr.guezrou.ecommerce.order.rest.request.CreateOrderRequest;
 import fr.guezrou.ecommerce.order.rest.request.OrderLineRequest;
-import fr.guezrou.ecommerce.order.rest.request.PaymentRequest;
-import fr.guezrou.ecommerce.order.rest.request.ReserveStockRequest;
-import fr.guezrou.ecommerce.order.rest.request.StockReservationItemRequest;
 import fr.guezrou.ecommerce.order.rest.response.OrderResponse;
-import fr.guezrou.ecommerce.order.rest.response.PaymentResponse;
-import fr.guezrou.ecommerce.order.rest.response.ReserveStockResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
@@ -31,8 +34,14 @@ import lombok.extern.slf4j.Slf4j;
 public class CreateOrderService {
 
     private final OrderRepositorty orderRepository;
-    private final StockClient stockClient;
-    private final PaymentClient paymentClient;
+
+    private final OutboxEventRepository outboxEventRepository;
+
+    public final OrderEventPublisher orderEventPublisher;
+
+    private final StockCommandPublisher stockCommandPublisher;
+
+    private final ObjectMapper objectMapper;
 
     public OrderResponse createOrder(CreateOrderRequest orderRequest) {
 
@@ -47,58 +56,93 @@ public class CreateOrderService {
         }
         OrderEntity savedOrder = orderRepository.save(orderEntity);
 
-        ReserveStockRequest stockRequest = new ReserveStockRequest(savedOrder.getId(), orderRequest.getLines().stream()
-                .map(line -> new StockReservationItemRequest(line.getProductId(), line.getQuantity())).toList()
+        List<OrderLineEvent> lines = orderRequest.getLines().stream()
+                .map(line -> new OrderLineEvent(line.getProductId(), line.getQuantity())).toList();
 
-        );
+        OrderCreatedEvent event = new OrderCreatedEvent(savedOrder.getId(), savedOrder.getCustomerId(),
+                savedOrder.getTotalAmount(), lines);
+
+        OutboxEventEntity outbox = new OutboxEventEntity();
+
+        outbox.setAggregateType("Order");
+        outbox.setAggregateId(savedOrder.getId().toString());
+        outbox.setEventType("OrderCreated");
+        outbox.setTopic(KafkaConfig.ORDER_CREATED_TOPIC);
+        outbox.setMessageKey(savedOrder.getId().toString());
 
         try {
-            ReserveStockResponse stockResponse = stockClient.reserveStock(stockRequest);
-            if (!"RESERVED".equals(stockResponse.getStatus())) {
-                throw new OrderCreationException("Unable to create order: stock reservation failed");
-            }
-
-            PaymentRequest payRequest = new PaymentRequest();
-            payRequest.setCustomerId(orderRequest.getCustomerId());
-            payRequest.setAmount(orderRequest.getTotalAmount());
-            payRequest.setOrderId(savedOrder.getId());
-            PaymentResponse payResponse = paymentClient.pay(payRequest);
-
-            if (!"COMPLETED".equals(payResponse.getStatus())) {
-                // Compensation
-                // payClient.releaseReservation(savedOrder.getId());
-                savedOrder.setStatus("CANCELLED");
-                orderRepository.save(savedOrder);
-                throw new OrderCreationException("Unable to create order: payment failed");
-            }
-
-            savedOrder.setStatus("CONFIRMED");
-            orderRepository.save(savedOrder);
-
-        } catch (StockServiceException exception) {
-            log.warn(exception.getMessage());
-            // savedOrder.setStatus("CANCELLED");
-            throw new OrderCreationException(String.format("Unable to create order: %s", exception.getMessage()));
+            outbox.setPayload(objectMapper.writeValueAsString(event));
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException("Impossible de sérialiser OrderCreated", exception);
         }
 
-        /*
-         * 
-         * OrderCreatedEvent event = new OrderCreatedEvent(savedOrder.getId(),
-         * savedOrder.getCustomerId(), savedOrder.getTotalAmount());
-         * 
-         * OutboxEventEntity outbox = new OutboxEventEntity();
-         * outbox.setEventType("OrderCreated"); outbox.setAggregateType("Order");
-         * outbox.setAggregateId(savedOrder.getId().toString());
-         * outbox.setPayload(objectMapper.writeValueAsString(event));
-         * outbox.setCreatedAt(LocalDateTime.now()); outbox.setPublished(false);
-         * 
-         * outboxRepository.save(outbox);
-         * 
-         */
+        outbox.setCreatedAt(LocalDateTime.now(ZoneOffset.UTC));
+        outbox.setPublished(false);
+
+        outboxEventRepository.save(outbox);
 
         OrderResponse orderResponse = new OrderResponse();
         orderResponse.setId(savedOrder.getId());
         return orderResponse;
+    }
+
+    @Transactional
+    public void handleStockReservedEvent(Long orderId) {
+
+        OrderEntity order = orderRepository.findById(orderId).orElseThrow(() -> new OrderNotFoundException(orderId));
+
+        order.setStockReserved(true);
+
+        if (order.isPaymentCompleted()) {
+            order.setStatus("CONFIRMED");
+            log.info("Commande {} confirmée ", orderId);
+        }
+
+        orderRepository.save(order);
+        log.info("Commande {} : stock réservé", orderId);
+    }
+
+    @Transactional
+    public void handleStockReservationFailedEvent(Long orderId, String reason) {
+
+        OrderEntity order = orderRepository.findById(orderId).orElseThrow(() -> new OrderNotFoundException(orderId));
+
+        order.setStatus("CANCELLED");
+        order.setCancelReason(reason);
+
+        orderRepository.save(order);
+
+        log.info("Commande {} annulée : {}", orderId, reason);
+    }
+
+    @Transactional
+    public void handlePaymentCompletedEvent(Long orderId) {
+
+        OrderEntity order = orderRepository.findById(orderId).orElseThrow(() -> new OrderNotFoundException(orderId));
+
+        order.setPaymentCompleted(true);
+
+        if (order.isStockReserved()) {
+            order.setStatus("CONFIRMED");
+            log.info("Commande {} confirmée ", orderId);
+        }
+
+        orderRepository.save(order);
+        log.info("Commande {} : Paiement confirmé", orderId);
+    }
+
+    @Transactional
+    public void handlePaymentFailedEvent(Long orderId, String reason) {
+
+        OrderEntity order = orderRepository.findById(orderId).orElseThrow(() -> new OrderNotFoundException(orderId));
+        order.setStatus("CANCELLED");
+        order.setCancelReason(reason);
+        orderRepository.save(order);
+        if (order.isStockReserved()) {
+            stockCommandPublisher.publishReleaseStock(order.getId());
+        }
+
+        log.warn("Commande {} annulée suite à un échec du paiement", order.getId());
     }
 
     private OrderLineEntity toOrderLineEntity(OrderLineRequest lineReq) {
